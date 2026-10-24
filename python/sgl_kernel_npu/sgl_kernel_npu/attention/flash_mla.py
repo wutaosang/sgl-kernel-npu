@@ -98,22 +98,34 @@ def _partial(
     qr = tl.load(
         Q + token * QS + h[:, None] * QH + (512 + r[None, :]) * QD, h[:, None] < H, 0
     )
-    tiles = tl.cdiv(length, BN)
-    begin = tl.cdiv(tiles, SPLITS) * split
-    end = tl.minimum(tl.cdiv(tiles, SPLITS) * (split + 1), tiles)
+    # Partition only visible tiles. In particular a short window must not
+    # iterate over the entire cache, and padded queries need no KV work.
+    visible_begin = 0
+    visible_end = length
+    if MODE == 3:
+        visible_end = tl.minimum(length, tl.maximum(0, anchor + 1))
+    if MODE == 4:
+        # Windows may be INT32_MAX; their arithmetic must not wrap.
+        anchor64 = anchor.to(tl.int64)
+        if LEFT >= 0:
+            visible_begin = tl.maximum(0, anchor64 - LEFT)
+        if RIGHT >= 0:
+            visible_end = tl.minimum(length, tl.maximum(0, anchor64 + RIGHT + 1))
+    visible_end = tl.where(active, visible_end, 0)
+    if MODE == 4 and LEFT >= 0:
+        visible_begin = tl.minimum(visible_begin, visible_end)
+    tiles = tl.cdiv(visible_end - visible_begin, BN)
+    per_split = tl.cdiv(tiles, SPLITS)
+    begin = per_split * split
+    end = tl.minimum(per_split * (split + 1), tiles)
     m = tl.full((BH,), -float("inf"), tl.float32)
     z = tl.zeros((BH,), tl.float32)
     acc = tl.zeros((BH, 512), tl.float32)
     for tile in range(begin, end):
-        n = tile * BN + tl.arange(0, BN)
-        valid = (n < length) & active
-        if MODE == 3:
-            valid = valid & (n <= anchor)
-        if MODE == 4:
-            if LEFT >= 0:
-                valid = valid & (n >= anchor - LEFT)
-            if RIGHT >= 0:
-                valid = valid & (n <= anchor + RIGHT)
+        # Start at the exact lower bound, without an extra masked tile for
+        # unaligned windows. Page crossings use the per-token block map.
+        n = visible_begin + tile * BN + tl.arange(0, BN)
+        valid = n < visible_end
         page = tl.load(TABLE + batch * TB + (n // PAGE) * TC, n < length, 0)
         base = page * KS + (n % PAGE) * KP
         kd = d * KD
@@ -371,7 +383,29 @@ def flash_mla(
         or not metadata.is_contiguous()
     ):
         raise ValueError("metadata must come from the A3 flash_mla_metadata backend")
-    splits = max(1, min(32, triton.cdiv(128, tokens * triton.cdiv(heads, 16))))
+    # A3's 192 KiB UB permits 32-head/64-key tiles with this static pipeline.
+    # Reuse KV across more heads for long contexts; retain the smaller group
+    # for short contexts/windows and NZ, where extra layout scratch is needed.
+    block_n = 64
+    capacity = block_table.shape[1] * page
+    visible_capacity = capacity
+    if mask_mode == 4 and win_left >= 0 and win_right >= 0:
+        visible_capacity = min(capacity, win_left + win_right + 1)
+        block_n = max(
+            16, min(block_n, triton.next_power_of_2(max(1, visible_capacity)))
+        )
+    block_h = (
+        32 if heads > 16 and visible_capacity >= 512 and layout_kv != "PA_NZ" else 16
+    )
+    programs = tokens * triton.cdiv(heads, block_h)
+    max_tiles = max(1, triton.cdiv(capacity, block_n))
+    if mask_mode == 4 and win_left >= 0 and win_right >= 0:
+        max_tiles = min(max_tiles, max(1, triton.cdiv(visible_capacity, block_n)))
+    splits = min(
+        32,
+        triton.next_power_of_2(triton.cdiv(128, programs)),
+        triton.next_power_of_2(max_tiles),
+    )
     partial = torch.empty(
         (tokens, heads, splits, 512), device=q.device, dtype=torch.float32
     )
@@ -382,7 +416,7 @@ def flash_mla(
         device=q.device,
         dtype=torch.float32,
     )
-    _partial[(tokens, triton.cdiv(heads, 16), splits)](
+    _partial[(tokens, triton.cdiv(heads, block_h), splits)](
         flat,
         k_cache,
         block_table,
@@ -406,6 +440,8 @@ def flash_mla(
         mask_mode,
         win_left,
         win_right,
+        BH=block_h,
+        BN=block_n,
         enable_mixed_cv=True,
         # The dynamic CV pipeline miscompiles this loop on the tested A3
         # compiler (triton-ascend 3.2.0). Keep the validated static pipeline.

@@ -1,8 +1,10 @@
 """Compare A3 FlashMLA with the existing single-query paged MLA kernel."""
 
 import argparse
+import importlib.util
 import json
 import statistics
+import sys
 
 import torch
 import torch_npu  # noqa: F401
@@ -36,7 +38,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repetitions", type=int, default=30)
     parser.add_argument("--include-fia", action="store_true")
+    parser.add_argument(
+        "--baseline-file", help="Previous flash_mla.py for a paired comparison"
+    )
     args = parser.parse_args()
+    baseline = None
+    if args.baseline_file:
+        spec = importlib.util.spec_from_file_location(
+            "flash_mla_baseline", args.baseline_file
+        )
+        baseline = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = baseline
+        spec.loader.exec_module(baseline)
     torch.npu.set_device(0)
     torch.manual_seed(19)
     results = []
@@ -84,9 +97,9 @@ def main():
 
         new_us, (output, _) = latency(new, args.repetitions)
         full_us, _ = latency(lambda: new(True), args.repetitions)
-        old_us, baseline = latency(old, args.repetitions)
+        old_us, decode_output = latency(old, args.repetitions)
         torch.testing.assert_close(
-            output.float(), baseline.float(), atol=0.003, rtol=0.03
+            output.float(), decode_output.float(), atol=0.003, rtol=0.03
         )
         results.append(
             dict(
@@ -100,6 +113,34 @@ def main():
                 speedup=old_us / new_us,
             )
         )
+        if baseline is not None:
+            previous_meta = baseline.flash_mla_metadata(
+                lengths, heads, 1, cu, layout_q="TND"
+            )
+
+            def previous(with_metadata=False):
+                return baseline.flash_mla(
+                    q,
+                    cache,
+                    table,
+                    lengths,
+                    cu,
+                    metadata=None if with_metadata else previous_meta,
+                    softmax_scale=1 / 24,
+                    layout_q="TND",
+                    layout_out="TND",
+                )
+
+            before_us, (before_output, _) = latency(previous, args.repetitions)
+            before_full_us, _ = latency(lambda: previous(True), args.repetitions)
+            torch.testing.assert_close(
+                output.float(), before_output.float(), atol=0.003, rtol=0.03
+            )
+            results[-1].update(
+                before_flash_mla_us=before_us,
+                before_flash_mla_with_metadata_us=before_full_us,
+                speedup_vs_before=before_us / new_us,
+            )
         if args.include_fia:
             padded_heads = triton.next_power_of_2(heads)
             padded = torch.zeros(

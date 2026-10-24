@@ -148,13 +148,34 @@ class TestFlashMLA(unittest.TestCase):
                     )
 
     def test_window_sink(self):
-        self.case(heads=16, counts=(3, 2), mode=4, window=(2, 1), sink=True)
+        for window in ((2, 1), (-1, -1), (2, -1), (-1, 0), (0, 0)):
+            with self.subTest(window=window):
+                self.case(heads=16, counts=(3, 2), mode=4, window=window, sink=True)
 
     def test_empty_kv(self):
         self.case(lengths=(0, 17), counts=(2, 1), mode=4, window=(0, 0), sink=True)
 
     def test_long_kv(self):
         self.case(heads=16, lengths=(4097,), counts=(1,))
+
+    def test_long_kv_layouts_many_heads(self):
+        for cache in ("PA_BBND", "PA_BNBD", "PA_NZ"):
+            with self.subTest(cache=cache):
+                self.case(heads=96, lengths=(2049,), counts=(1,), cache_layout=cache)
+
+    def test_head_group_boundaries(self):
+        for heads in (17, 33, 65, 128):
+            with self.subTest(heads=heads):
+                self.case(heads=heads, lengths=(1025,), counts=(1,))
+        self.case(dtype=torch.float16, heads=33, lengths=(1025,), counts=(1,))
+
+    def test_window_on_long_cache(self):
+        self.case(
+            heads=96, lengths=(4097,), counts=(1,), mode=4, window=(127, 0), sink=True
+        )
+
+    def test_int32_max_window(self):
+        self.case(counts=(3, 2), mode=4, window=(2147483647, 2147483647))
 
     def test_page_size_boundaries(self):
         for page in (16, 1024):
@@ -183,13 +204,15 @@ class TestFlashMLA(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "window"):
             flash_mla_metadata(lengths, 16, 1, max_seqlen_q=1, win_left=3)
 
-    def test_graph_device_lengths(self):
+    def _check_graph_device_lengths(self, heads, page, replay_lengths, window=None):
         torch.manual_seed(23)
-        q = torch.randn((1, 8, 576), dtype=torch.bfloat16, device="npu") * 0.3
-        cache = torch.randn((5, 32, 1, 576), dtype=q.dtype, device="npu") * 0.3
-        table = torch.arange(5, dtype=torch.int32, device="npu").reshape(1, 5)
-        lengths = torch.tensor([129], dtype=torch.int32, device="npu")
+        pages = (max(replay_lengths) + page - 1) // page
+        q = torch.randn((1, heads, 576), dtype=torch.bfloat16, device="npu") * 0.3
+        cache = torch.randn((pages, page, 1, 576), dtype=q.dtype, device="npu") * 0.3
+        table = torch.arange(pages, dtype=torch.int32, device="npu").reshape(1, pages)
+        lengths = torch.tensor([replay_lengths[0]], dtype=torch.int32, device="npu")
         cu = torch.tensor([0, 1], dtype=torch.int32, device="npu")
+        sinks = torch.randn(heads, device="npu") if window is not None else None
 
         def run():
             return flash_mla(
@@ -198,6 +221,11 @@ class TestFlashMLA(unittest.TestCase):
                 table,
                 lengths,
                 cu,
+                sinks=sinks,
+                attn_mask=self.mask if window is not None else None,
+                mask_mode=4 if window is not None else 0,
+                win_left=window[0] if window is not None else -1,
+                win_right=window[1] if window is not None else -1,
                 softmax_scale=1 / 24,
                 layout_q="TND",
                 layout_out="TND",
@@ -210,23 +238,40 @@ class TestFlashMLA(unittest.TestCase):
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
             out, lse = run()
-        for length in (129, 17, 0, 101):
+        for length in replay_lengths:
             lengths.fill_(length)
             graph.replay()
             torch.npu.synchronize()
             kv = cache.cpu().reshape(-1, 576)[:length].float()
             if length:
+                if window is not None:
+                    kv = kv[max(0, length - 1 - window[0]) :]
                 score = q.cpu()[0].float() @ kv.T / 24
-                expected = score.softmax(-1) @ kv[:, :512]
+                denominator = (
+                    score
+                    if sinks is None
+                    else torch.cat((score, sinks.cpu()[:, None]), 1)
+                )
+                expected_lse = denominator.logsumexp(-1)
+                expected = (score - expected_lse[:, None]).exp() @ kv[:, :512]
                 torch.testing.assert_close(
                     out.cpu()[0].float(), expected, atol=0.003, rtol=0.02
                 )
                 torch.testing.assert_close(
-                    lse.cpu()[:, 0], score.logsumexp(-1), atol=0.004, rtol=0.002
+                    lse.cpu()[:, 0], expected_lse, atol=0.004, rtol=0.002
                 )
             else:
                 self.assertEqual(out.count_nonzero().item(), 0)
                 self.assertTrue(lse.isposinf().all().item())
+
+    def test_graph_device_lengths(self):
+        self._check_graph_device_lengths(8, 32, (129, 17, 0, 101))
+        self._check_graph_device_lengths(96, 128, (2049, 17, 0, 1025))
+
+    def test_graph_window_device_lengths(self):
+        self._check_graph_device_lengths(
+            96, 128, (2049, 129, 127, 17, 0, 1025), window=(127, 0)
+        )
 
 
 if __name__ == "__main__":

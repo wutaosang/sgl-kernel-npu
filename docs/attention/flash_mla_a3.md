@@ -71,23 +71,44 @@ preconditions; the wrapper does not synchronize to validate tensor contents.
 ## Implementation
 
 Metadata generation snapshots query offsets, effective query lengths and KV
-lengths on device. Attention uses 16-head by 64-key tiles, separate 512-channel
-content and 64-channel RoPE dot products, online FP32 softmax, and split-KV.
-A second kernel combines partial outputs and adds each sink exactly once.
-Splits depend only on query shapes, so changing device lengths does not require
-host scheduling or a different captured graph.
+lengths on device. Attention uses separate 512-channel content and 64-channel
+RoPE dot products, online FP32 softmax, and split-KV. A second kernel combines
+partial outputs and adds each sink exactly once.
+
+The A3 schedule uses 32-head by 64-key tiles for more than 16 heads when cache
+capacity is at least 512 tokens. It retains 16-head tiles for short contexts,
+small windows and NZ layouts. Fully bounded windows can use smaller 16/32-key
+tiles. Split counts use a shape-based budget of 128 logical tasks, are rounded
+to powers of two, capped at 32, and limited using cache/window capacity. This is
+not a length-aware per-core scheduler; it never reads actual device lengths on
+the host. Changing lengths therefore preserves the captured launch grid.
+
+Each request partitions only its visible KV interval on device. Causal bounds
+use effective query lengths; windows start at their exact lower bound and use
+the paged block map across page boundaries. Inactive query rows do no KV work.
+Window arithmetic uses int64 so INT32_MAX window attributes cannot overflow.
+
+The schedule was informed by A3 KV reuse and FlashDecode separation in
+[sgl-kernel-npu's arch22 SFA](https://github.com/sgl-project/sgl-kernel-npu/blob/6fba476a4c4387fdbb4aec09f0619415b9495f0d/csrc/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_service_cube_mla.h)
+and CANN's A3 FIA
+[Cube block](https://gitcode.com/cann/ops-transformer/blob/f4de7a8e47e112224f2a08dba9d0592f0c972426/attention/fused_infer_attention_score/op_kernel/arch22/fia_block_cube_nonquant_mla.h)
+and [FlashDecode block](https://gitcode.com/cann/ops-transformer/blob/f4de7a8e47e112224f2a08dba9d0592f0c972426/attention/fused_infer_attention_score/op_kernel/arch22/fia_block_vec_flashdecode_arch22.h).
+Their explicit L1 buffering and Cube/vector pipeline are not ported here, and
+no source from those implementations is copied into the Triton kernel.
 
 The A3 compiler requires conservative tiling: 128-key tiles exceeded the 192 KiB
-UB limit in this implementation. Enabling the dynamic CV pipeline also failed
+UB limit with the full 512-channel accumulator. Enabling the dynamic CV pipeline also failed
 the numerical comparison on the tested compiler; the kernel explicitly uses the
 validated static CV pipeline. Large-head decode still repeats cache loads across
-head groups and has substantial per-tile overhead. Improving cache reuse and
+head groups and has substantial per-tile overhead. Further cache reuse and
 Cube/vector pipelining is required before enabling this backend in production.
 
 Temporary storage is approximately
 `T * H * splits * (512 + 1) * 4` bytes, excluding output and layout conversions.
 This backend targets decode and short verification queries; large prefill
-workloads have not been benchmarked.
+workloads have not been benchmarked. The wider head group and split rounding
+can increase scratch storage: the measured B=4, H=96, KV=4096 case uses about
+12 MiB for partials/LSE, versus 4.5 MiB in the original prototype.
 
 ## Build and validation
 
@@ -102,11 +123,22 @@ python3 tests/python/sgl_kernel_npu/test_flash_mla.py -v
 python3 tests/python/sgl_kernel_npu/bench_flash_mla.py --include-fia
 ```
 
+To compare with the original prototype on the same inputs:
+
+```bash
+git show 1dba6fd:python/sgl_kernel_npu/sgl_kernel_npu/attention/flash_mla.py > /tmp/flash_mla_before_tiling.py
+python3 tests/python/sgl_kernel_npu/bench_flash_mla.py --include-fia --baseline-file /tmp/flash_mla_before_tiling.py
+```
+
 The tests use a separate FP32 PyTorch reference with shuffled page tables. They
 cover ragged multi-query causality, padding, completely masked rows, empty KV,
 empty query requests, small and 96-head groups, layouts, sinks, windows, LSE,
 and argument rejection. The graph test replays the same graph with device KV
-lengths 129, 17, 0 and 101. BF16 output tolerance is `atol=0.003, rtol=0.02`;
+lengths 129, 17, 0 and 101 for small heads, and 2049, 17, 0 and 1025 for
+96 heads. Tests also cover 17/33/65/128 head boundaries, long-context cache
+layouts and INT32_MAX windows. A separate window/sink graph replays lengths
+2049, 129, 127, 17, 0 and 1025, including windows crossing page boundaries.
+BF16 output tolerance is `atol=0.003, rtol=0.02`;
 FP16 uses `atol=0.0004, rtol=0.02`; LSE uses `atol=0.004, rtol=0.002`.
 
 The development wheel reused the environment's unchanged `libsgl_kernel_npu.so`
@@ -114,7 +146,45 @@ and packaged the updated Python modules with the normal Ascend910 provider
 staging. This validates the Python-only migration and wheel import; it does not
 claim a fresh build of all unrelated C++ operators.
 
-## Measured decode performance
+## Paired A3 tiling optimization results
+
+The installed Ascend910 wheel passed all 19 unittest methods. The following
+measurements compare with prototype commit `1dba6fd` on the same inputs and
+device, using the environment described below. Decode timings exclude metadata
+and are medians of five groups of 30 warmed graph replays.
+
+| Batch | Heads | KV length | Before | Optimized | Speedup | FIA |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 16 | 4096 | 55.5 us | 56.5 us | 0.98x | 34.1 us |
+| 1 | 96 | 16384 | 608.4 us | 320.6 us | 1.90x | 68.6 us |
+| 4 | 96 | 4096 | 628.4 us | 327.0 us | 1.92x | 72.1 us |
+
+The 16-head case has no measured gain and is about 2% slower in this run.
+The wider-head gains do not establish superiority over FIA: all three points
+remain slower than FIA. With metadata included, the optimized 96-head points
+take 326.9 us and 333.3 us respectively.
+
+Additional FP32-reference-checked cases include metadata and use medians of
+three groups of 20 graph replays. All have 96 heads and BF16 inputs:
+
+| Case | Before | Optimized | Speedup |
+| --- | ---: | ---: | ---: |
+| KV=16384, 128-token window, sink | 607.1 us | 35.5 us | 17.08x |
+| Ragged causal, KV=4097/2049, physical Q=3/2, used Q=2/1 | 614.3 us | 265.7 us | 2.31x |
+| Fixed causal, KV=4096, physical Q=4, used Q=3 | 636.6 us | 273.2 us | 2.33x |
+
+These gains come from KV reuse, limiting split count for small visible ranges,
+and skipping invisible/padded work. A separate eager profile at B=1, H=96,
+KV=16384 measured 293.0 us in partial attention, 1.6 us metadata and 8.1 us
+merge: about 96.8% of summed kernel time remains in partial attention.
+The exact measurements, source/wheel hashes and experiment summaries are in
+[flash_mla_a3_tiling_results.json](flash_mla_a3_tiling_results.json).
+Whole-model performance and large prefill have not been measured.
+
+## Original prototype measurements
+
+This section records the original `1dba6fd` prototype, before the optimization
+above. It is retained as the earlier baseline.
 
 Measured on server 88, one idle `Ascend910_9362` die (physical device 4),
 2026-10-24, CANN 9.1.0 A3 B103 image, PyTorch `2.10.0+cpu`,
